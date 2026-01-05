@@ -51,7 +51,13 @@ jobs:
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
 
       - name: Build
-        run: wails build -platform ${{ matrix.platform }} -o ${{ matrix.output }}
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            wails build -platform ${{ matrix.platform }} -o ${{ matrix.output }} -tags webkit2_41
+          else
+            wails build -platform ${{ matrix.platform }} -o ${{ matrix.output }}
+          fi
+        shell: bash
 
       - name: Package macOS app
         if: runner.os == 'macOS'
