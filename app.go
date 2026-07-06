@@ -9,18 +9,26 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 	"github.com/zwopir/ticktickup/ticktick"
 )
 
 type App struct {
-	ctx           context.Context
-	client        *ticktick.Client
-	oauthServer   *http.Server
-	oauthListener net.Listener
-	authCodeChan  chan string
-	mu            sync.Mutex
+	ctx            context.Context
+	client         *ticktick.Client
+	oauthServer    *http.Server
+	oauthListener  net.Listener
+	authResultChan chan authResult
+	mu             sync.Mutex
+}
+
+// authResult carries the outcome of the OAuth callback (success or failure)
+// so WaitForAuthCode always unblocks, even when auth fails or is cancelled.
+type authResult struct {
+	code string
+	err  error
 }
 
 type ProjectInfo struct {
@@ -54,7 +62,7 @@ type SubtaskInput struct {
 
 func NewApp() *App {
 	return &App{
-		authCodeChan: make(chan string, 1),
+		authResultChan: make(chan authResult, 1),
 	}
 }
 
@@ -157,9 +165,9 @@ func (a *App) StartAuth() (string, error) {
 		}
 	}()
 
-	// Clear any stale auth codes
+	// Clear any stale auth results
 	select {
-	case <-a.authCodeChan:
+	case <-a.authResultChan:
 	default:
 	}
 
@@ -180,6 +188,11 @@ func (a *App) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 			<p>Error: %s</p>
 			<p>You can close this window.</p>
 		</body></html>`, errorMsg)
+
+		select {
+		case a.authResultChan <- authResult{err: fmt.Errorf("oauth error: %s", errorMsg)}:
+		default:
+		}
 		return
 	}
 
@@ -190,35 +203,50 @@ func (a *App) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 			<p>No authorization code received.</p>
 			<p>You can close this window.</p>
 		</body></html>`)
+
+		select {
+		case a.authResultChan <- authResult{err: fmt.Errorf("no authorization code received")}:
+		default:
+		}
 		return
 	}
 
-	// Send code to channel
-	select {
-	case a.authCodeChan <- code:
-	default:
-	}
-
+	// Write the success response before signaling the channel, so the
+	// server isn't shut down while this response is still in flight.
 	fmt.Fprintf(w, `<!DOCTYPE html><html><body>
 		<h1>Authentication Successful!</h1>
 		<p>You can close this window and return to the app.</p>
 		<script>setTimeout(function() { window.close(); }, 2000);</script>
 	</body></html>`)
+
+	select {
+	case a.authResultChan <- authResult{code: code}:
+	default:
+	}
 }
 
 func (a *App) WaitForAuthCode() error {
-	code := <-a.authCodeChan
+	result := <-a.authResultChan
 
-	// Shutdown the OAuth server
+	// Gracefully shut down the OAuth server, letting the in-flight callback
+	// response finish writing instead of severing the connection.
 	if a.oauthServer != nil {
-		a.oauthServer.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := a.oauthServer.Shutdown(ctx); err != nil {
+			a.oauthServer.Close()
+		}
 	}
 	if a.oauthListener != nil {
 		a.oauthListener.Close()
 	}
 
+	if result.err != nil {
+		return result.err
+	}
+
 	// Exchange code for token
-	token, err := a.client.ExchangeCode(code)
+	token, err := a.client.ExchangeCode(result.code)
 	if err != nil {
 		return fmt.Errorf("exchanging code: %w", err)
 	}
